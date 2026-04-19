@@ -107,7 +107,7 @@ NO_SYSTEMATIC_STRATEGY = StrategyParams(
     min_liquidity=1_000.0,
     min_days_to_expiry=14,
     max_days_to_expiry=200,
-    max_positions=100,
+    max_positions=30,      # ~$25/posição × 30 = $750 max (75% do bankroll de $1000)
     max_per_event=3,
     kelly_fraction=0.25,
     base_win_rate=0.70,
