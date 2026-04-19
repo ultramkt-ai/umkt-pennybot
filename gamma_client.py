@@ -21,13 +21,7 @@ import requests
 from config import GAMMA_API_BASE
 
 
-# ─── Rate limit simples (token bucket por endpoint) ──────────────────────────
-#
-# A doc oficial fala em 500/10s para /events. Como vamos fazer 1 request por
-# categoria em loop, na prática ficamos muito abaixo — o throttle aqui é só
-# uma rede de segurança em caso de bug/retries.
-
-_MIN_INTERVAL_SECONDS = 0.1   # no máximo 10 req/s por endpoint
+_MIN_INTERVAL_SECONDS = 0.1
 _last_request_time: dict[str, float] = {}
 
 
@@ -53,10 +47,6 @@ def _get_json(
     max_retries: int = 3,
     timeout: float = 15.0,
 ) -> Any:
-    """
-    GET /<endpoint> com retry exponencial em 429/5xx/timeout.
-    Retorna JSON decodificado. Lança GammaAPIError se falhar definitivamente.
-    """
     url = f"{GAMMA_API_BASE}/{endpoint.lstrip('/')}"
 
     for attempt in range(max_retries):
@@ -83,22 +73,14 @@ def _get_json(
             time.sleep(2 ** attempt)
             continue
 
-        # 4xx não retriáveis
         raise GammaAPIError(f"{url} retornou {resp.status_code}: {resp.text[:200]}")
 
     raise GammaAPIError(f"Retries esgotados em {url}")
 
 
-# ─── Parsing defensivo de campos da API ──────────────────────────────────────
-#
-# A Gamma API retorna alguns campos como STRING contendo JSON, por razões
-# históricas. Temos que parsear manualmente.
+# ─── Parsing defensivo ───────────────────────────────────────────────────────
 
 def _parse_json_string_list(value: Any) -> list:
-    """
-    Parseia campos como 'outcomePrices' = '["0.65","0.35"]' para [0.65, 0.35].
-    Aceita também listas já parseadas, strings vazias e None.
-    """
     if value is None or value == "":
         return []
     if isinstance(value, list):
@@ -113,7 +95,6 @@ def _parse_json_string_list(value: Any) -> list:
 
 
 def _safe_float(value: Any, default: float = 0.0) -> float:
-    """Converte para float tolerando string, None, '', etc."""
     if value is None or value == "":
         return default
     try:
@@ -138,23 +119,7 @@ def fetch_events_by_tag(
     """
     Itera sobre todos os eventos de uma tag, paginando com limit/offset.
 
-    Args:
-        tag_id: ID oficial da tag (ver POLYMARKET_TAGS em config.py)
-        closed: se True, inclui mercados fechados (padrão: só abertos)
-        active: se True, só eventos ativos (padrão: True)
-        page_size: itens por página (100 é seguro, API aceita até 500)
-        max_pages: teto de páginas para evitar loops infinitos
-        liquidity_min: filtra server-side por liquidez mínima (em USD).
-                       Transfere menos dados — recomendado se souber o mínimo.
-        order: campo para ordenação. Default 'volume24hr' traz os mercados
-               mais ativos primeiro.
-        ascending: direção da ordenação. Default False = decrescente.
-
-    Yields eventos BRUTOS da API (dicts sem normalizar) — quem usa decide
-    o que fazer com os campos. O scanner normaliza depois.
-
-    Rate limit: /events tem 500 req/10s. Com page_size=100 e max_pages=20,
-    pior caso = 20 req por categoria, bem dentro do limite.
+    Yields eventos BRUTOS da API (dicts sem normalizar).
     """
     offset = 0
     for _ in range(max_pages):
@@ -164,7 +129,7 @@ def fetch_events_by_tag(
             "active": str(active).lower(),
             "limit": page_size,
             "offset": offset,
-            "related_tags": "true",  # inclui sub-tags da categoria (ex: BTC dentro de Crypto)
+            "related_tags": "true",
             "order": order,
             "ascending": str(ascending).lower(),
         }
@@ -180,7 +145,7 @@ def fetch_events_by_tag(
             yield event
 
         if len(batch) < page_size:
-            return  # última página
+            return
 
         offset += page_size
 
@@ -188,25 +153,16 @@ def fetch_events_by_tag(
 def normalize_market(raw_market: dict, parent_event: dict | None = None) -> dict:
     """
     Transforma um market bruto da API num dict plano com os campos que o bot usa.
-
-    Campos chave extraídos/parseados:
-      - market_id, condition_id, event_id, question
-      - yes_price, no_price (parseados de outcomePrices string)
-      - yes_token_id, no_token_id (parseados de clobTokenIds string)
-      - liquidity, volume, end_date, active, closed
-      - tags (lista de dicts {id, label, ...}) vinda do parent event, se houver
     """
     prices = _parse_json_string_list(raw_market.get("outcomePrices"))
     token_ids = _parse_json_string_list(raw_market.get("clobTokenIds"))
     outcomes = _parse_json_string_list(raw_market.get("outcomes"))
 
-    # Binary market padrão: outcomes = ["Yes", "No"] → índice 0 = YES
     yes_price = _safe_float(prices[0]) if len(prices) > 0 else 0.0
     no_price = _safe_float(prices[1]) if len(prices) > 1 else 0.0
     yes_token_id = str(token_ids[0]) if len(token_ids) > 0 else ""
     no_token_id = str(token_ids[1]) if len(token_ids) > 1 else ""
 
-    # Tags vêm no evento pai (a Gamma retorna tags no Event, não no Market)
     event_tags: list[dict] = []
     event_id = ""
     if parent_event is not None:
@@ -233,89 +189,3 @@ def normalize_market(raw_market: dict, parent_event: dict | None = None) -> dict
         "accepting_orders": bool(raw_market.get("acceptingOrders", False)),
         "tags": event_tags,
     }
-
-
-# ─── Wallet Positions API ────────────────────────────────────────────────────
-
-from dataclasses import dataclass
-
-
-@dataclass
-class WalletPosition:
-    """Posição aberta em uma wallet Polymarket."""
-    market_id: str
-    condition_id: str
-    event_id: str
-    question: str
-    side: str  # "YES" ou "NO"
-    shares: float
-    avg_price: float
-    total_cost: float
-    current_value: float
-    realized_pnl: float
-    unrealized_pnl: float
-    token_id: str
-
-
-def get_wallet_positions(wallet_address: str) -> list[WalletPosition]:
-    """
-    Busca todas as posições abertas de uma wallet na Polymarket API.
-
-    Endpoint: GET /positions?user={wallet_address}&market_status=active
-    Retorna lista de WalletPosition com dados normalizados.
-
-    A API retorna posições com:
-      - market, outcome (YES/NO), quantity (shares), averagePrice
-      - realizedPnl, totalCost, position (current value)
-    """
-    params = {
-        "user": wallet_address,
-        "market_status": "active",
-    }
-
-    data = _get_json("positions", params=params)
-
-    if not isinstance(data, list):
-        return []
-
-    positions: list[WalletPosition] = []
-
-    for item in data:
-        market = item.get("market", {})
-        outcome = item.get("outcome", "")
-        side = "YES" if outcome == "YES" else "NO"
-
-        # Token ID vem do market outcomes
-        outcomes = _parse_json_string_list(market.get("outcomes"))
-        token_ids = _parse_json_string_list(market.get("clobTokenIds"))
-
-        # Mapear outcome → token_id
-        token_id = ""
-        if outcome == "YES" and len(token_ids) > 0:
-            token_id = str(token_ids[0])
-        elif outcome == "NO" and len(token_ids) > 1:
-            token_id = str(token_ids[1])
-
-        shares = _safe_float(item.get("quantity"), 0.0)
-        avg_price = _safe_float(item.get("averagePrice"), 0.0)
-        total_cost = _safe_float(item.get("totalCost"), 0.0)
-        current_value = _safe_float(item.get("position"), 0.0)
-        realized_pnl = _safe_float(item.get("realizedPnl"), 0.0)
-        unrealized_pnl = current_value - total_cost
-
-        positions.append(WalletPosition(
-            market_id=str(market.get("id", "")),
-            condition_id=str(market.get("conditionId", "")),
-            event_id=str(market.get("event", {}).get("id", "")),
-            question=market.get("question", ""),
-            side=side,
-            shares=shares,
-            avg_price=avg_price,
-            total_cost=total_cost,
-            current_value=current_value,
-            realized_pnl=realized_pnl,
-            unrealized_pnl=unrealized_pnl,
-            token_id=token_id,
-        ))
-
-    return positions

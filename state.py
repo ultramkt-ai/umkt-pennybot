@@ -28,16 +28,20 @@ CREATE TABLE IF NOT EXISTS positions (
     market_id       TEXT NOT NULL,
     condition_id    TEXT NOT NULL,
     event_id        TEXT NOT NULL,
-    strategy        TEXT NOT NULL,          -- "penny" | "no_systematic"
-    side            TEXT NOT NULL,           -- "YES" | "NO"
+    strategy        TEXT NOT NULL,
+    side            TEXT NOT NULL,
     entry_price     REAL NOT NULL,
     shares          REAL NOT NULL,
     cost            REAL NOT NULL,
     current_price   REAL,
+    token_id        TEXT DEFAULT '',
+    target_exit     REAL,
+    stop_price      REAL,
+    bounce_exit_pct REAL,
     category        TEXT DEFAULT 'other',
-    status          TEXT DEFAULT 'open',     -- "open" | "closed" | "resolved"
+    status          TEXT DEFAULT 'open',
     exit_price      REAL,
-    exit_reason     TEXT,                    -- "take_profit" | "stop_loss" | "resolved_win" | "resolved_loss" | "manual"
+    exit_reason     TEXT,
     pnl             REAL,
     opened_at       TEXT NOT NULL,
     closed_at       TEXT,
@@ -48,7 +52,7 @@ CREATE TABLE IF NOT EXISTS positions (
 CREATE TABLE IF NOT EXISTS trades_history (
     id              INTEGER PRIMARY KEY AUTOINCREMENT,
     position_id     INTEGER NOT NULL,
-    action          TEXT NOT NULL,           -- "open" | "close"
+    action          TEXT NOT NULL,
     price           REAL NOT NULL,
     shares          REAL NOT NULL,
     timestamp       TEXT NOT NULL,
@@ -125,6 +129,10 @@ class StateManager:
         side: str,
         entry_price: float,
         shares: float,
+        token_id: str = "",
+        target_exit: float | None = None,
+        stop_price: float | None = None,
+        bounce_exit_pct: float | None = None,
         category: str = "other",
         market_question: str = "",
     ) -> int:
@@ -136,12 +144,14 @@ class StateManager:
             cursor = conn.execute(
                 """INSERT INTO positions
                    (market_id, condition_id, event_id, strategy, side,
-                    entry_price, shares, cost, current_price, category,
-                    status, opened_at, market_question)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)""",
+                    entry_price, shares, cost, current_price, token_id,
+                    target_exit, stop_price, bounce_exit_pct,
+                    category, status, opened_at, market_question)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'open', ?, ?)""",
                 (market_id, condition_id, event_id, strategy, side,
-                 entry_price, shares, cost, entry_price, category,
-                 now, market_question),
+                 entry_price, shares, cost, entry_price, token_id,
+                 target_exit, stop_price, bounce_exit_pct,
+                 category, now, market_question),
             )
             position_id = cursor.lastrowid
 
@@ -173,16 +183,6 @@ class StateManager:
                 raise ValueError(f"Posição {position_id} não encontrada ou já fechada")
 
             pnl = (exit_price - row["entry_price"]) * row["shares"]
-            # PnL é igual para YES e NO: diferença entre preço de saída e
-            # entrada do TOKEN que foi comprado, × shares.
-            #
-            # Se comprou YES a $0.03 e vendeu a $0.08 → PnL = +$0.05/share
-            # Se comprou NO  a $0.30 e vendeu a $0.46 → PnL = +$0.16/share
-            #
-            # Na resolução:
-            #   YES resolve "1" → exit_price efetivo = $1.00
-            #   NO  resolve "1" (NO ganha) → exit_price efetivo = $1.00
-            #   Token que perde → exit_price efetivo = $0.00
 
             conn.execute(
                 """UPDATE positions
@@ -218,78 +218,6 @@ class StateManager:
                 "UPDATE positions SET current_price = ? WHERE id = ?",
                 (price, position_id),
             )
-
-    def adjust_position_shares(
-        self,
-        position_id: int,
-        delta_shares: float,
-        adjustment_price: float,
-    ) -> dict[str, any]:
-        """
-        Ajusta shares de uma posição aberta (aumento ou redução).
-        Usado para copytrading quando wallet ajusta posição.
-
-        delta_shares > 0 → compra mais shares
-        delta_shares < 0 → vende shares (partial exit)
-
-        Retorna dados do ajuste para auditoria.
-        """
-        now = datetime.now(timezone.utc).isoformat()
-
-        with self._connect() as conn:
-            row = conn.execute(
-                "SELECT * FROM positions WHERE id = ? AND status = 'open'",
-                (position_id,),
-            ).fetchone()
-
-            if row is None:
-                raise ValueError(f"Posição {position_id} não encontrada ou já fechada")
-
-            new_shares = row["shares"] + delta_shares
-            if new_shares <= 0:
-                raise ValueError("Ajuste resultaria em shares ≤ 0 — use close_position ao invés")
-
-            # Calcular novo preço médio (se compra) ou PnL realizado (se venda)
-            if delta_shares > 0:
-                # Compra: novo preço médio = (custo_atual + custo_adicional) / novas_shares
-                additional_cost = adjustment_price * delta_shares
-                new_entry_price = (row["cost"] + additional_cost) / new_shares
-                new_cost = row["cost"] + additional_cost
-                pnl_realized = 0.0
-            else:
-                # Venda parcial: realiza PnL proporcional
-                sold_pct = abs(delta_shares) / row["shares"]
-                pnl_realized = row["pnl"] * sold_pct if row.get("pnl") else 0.0
-                new_entry_price = row["entry_price"]  # mantém preço médio original
-                new_cost = row["cost"] * (1 - sold_pct)
-
-            # Atualizar posição
-            conn.execute(
-                """UPDATE positions
-                   SET shares = ?, entry_price = ?, cost = ?,
-                       current_price = ?, pnl = pnl - ?
-                   WHERE id = ?""",
-                (new_shares, new_entry_price, new_cost, adjustment_price, pnl_realized, position_id),
-            )
-
-            # Registrar no trades_history
-            action = "adjust_up" if delta_shares > 0 else "adjust_down"
-            conn.execute(
-                """INSERT INTO trades_history
-                   (position_id, action, price, shares, timestamp, reason)
-                   VALUES (?, ?, ?, ?, ?, ?)""",
-                (position_id, action, adjustment_price, abs(delta_shares), now, "mirror_adjust"),
-            )
-
-        return {
-            "position_id": position_id,
-            "delta_shares": delta_shares,
-            "new_shares": new_shares,
-            "adjustment_price": adjustment_price,
-            "pnl_realized": pnl_realized,
-            "new_entry_price": new_entry_price,
-            "new_cost": new_cost,
-        }
 
     def get_open_positions(self, strategy: str | None = None) -> list[dict]:
         query = "SELECT * FROM positions WHERE status = 'open'"
@@ -428,7 +356,7 @@ class StateManager:
 
         return filepath
 
-    # ─── Stats rápidas (usadas por analytics e monitor) ──────────────────
+    # ─── Stats rápidas ───────────────────────────────────────────────────
 
     def get_stats_summary(self) -> dict:
         with self._connect() as conn:
