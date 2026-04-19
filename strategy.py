@@ -27,6 +27,7 @@ class TradeSignal:
     event_id: str
     question: str
     side: str               # "YES" ou "NO"
+    token_id: str           # CLOB token ID para consultar preço no monitor
     entry_price: float      # Preço de entrada (YES ou NO, dependendo da strategy)
     ev: float               # Expected value por share
     ev_pct: float           # EV como % do custo
@@ -34,6 +35,7 @@ class TradeSignal:
     cost: float             # Custo total da posição = entry_price × shares
     target_exit: float      # Preço-alvo de saída (take profit)
     stop_price: float       # Preço de stop loss
+    bounce_exit_pct: float | None  # Fração do TP para bounce exit (None = penny)
     category: str
     strategy_name: str
 
@@ -52,17 +54,13 @@ def calculate_ev(
       - Se YES a $0.03 e resolve YES → ganha $1.00 - $0.03 = $0.97 por share
       - Se resolve NO → perde $0.03 por share
 
-    Portanto:
-      payoff_líquido = payoff - entry_price  (default payoff = $1.00)
-      custo = entry_price
-
     EV > 0 → posição com expectativa positiva.
     """
     if entry_price <= 0 or entry_price >= payoff:
         return 0.0
 
-    win_payoff = payoff - entry_price     # ganho líquido se acertar
-    loss_cost = entry_price               # quanto perde se errar
+    win_payoff = payoff - entry_price
+    loss_cost = entry_price
 
     return (win_rate * win_payoff) - ((1 - win_rate) * loss_cost)
 
@@ -76,9 +74,6 @@ def calculate_kelly_fraction(
     """
     Fração ótima do bankroll segundo Kelly, ajustada por kelly_fraction.
 
-    Kelly completo: f* = (p × b - q) / b
-      onde p = win_rate, q = 1-p, b = payoff/custo
-
     Quarter-Kelly (kelly_fraction=0.25) é mais conservador e resiste
     melhor a erros na estimativa de win_rate.
 
@@ -87,7 +82,7 @@ def calculate_kelly_fraction(
     if entry_price <= 0 or entry_price >= payoff:
         return 0.0
 
-    b = (payoff - entry_price) / entry_price  # odds líquidas
+    b = (payoff - entry_price) / entry_price
     p = win_rate
     q = 1.0 - p
 
@@ -134,10 +129,9 @@ def calculate_targets(
       target_exit = 0.03 × 3.0 = 0.09
       stop_price  = 0.03 × (1 - 0.5) = 0.015
 
-    NO sist. (side=NO, entry=0.30):
-      Aqui o "preço" é quanto pagou pelo NO. Se pagou $0.30, para dar TP
-      de 1.5x, precisa que o NO suba a $0.30 × 1.5 = $0.45.
-      Stop: $0.30 × (1 - 0.5) = $0.15.
+    NO sist. (side=NO, entry=0.30, TP=1.5, SL=0.5):
+      target_exit = 0.30 × 1.5 = 0.45
+      stop_price  = 0.30 × 0.5 = 0.15
 
     Retorna (target_exit, stop_price).
     """
@@ -161,8 +155,10 @@ def evaluate_market(
     """
     if strategy.side == "YES":
         entry_price = market.get("yes_price", 0.0)
+        token_id = market.get("yes_token_id", "")
     else:
         entry_price = market.get("no_price", 0.0)
+        token_id = market.get("no_token_id", "")
 
     if entry_price <= 0:
         return None
@@ -193,6 +189,7 @@ def evaluate_market(
         event_id=market.get("event_id", ""),
         question=market.get("question", "")[:100],
         side=strategy.side,
+        token_id=token_id,
         entry_price=entry_price,
         ev=round(ev, 6),
         ev_pct=round(ev_pct, 4),
@@ -200,18 +197,14 @@ def evaluate_market(
         cost=round(entry_price * shares, 4),
         target_exit=round(target_exit, 4),
         stop_price=round(stop_price, 4),
+        bounce_exit_pct=strategy.bounce_exit_threshold,
         category=market.get("category", "other"),
         strategy_name=strategy.name,
     )
 
 
 def rank_signals(signals: list[TradeSignal]) -> list[TradeSignal]:
-    """
-    Ordena sinais por EV% decrescente.
-
-    Quando temos mais oportunidades do que posições disponíveis,
-    preferimos as com melhor retorno percentual.
-    """
+    """Ordena sinais por EV% decrescente."""
     return sorted(signals, key=lambda s: s.ev_pct, reverse=True)
 
 
@@ -225,9 +218,6 @@ def generate_signals(
     """
     Pipeline completo: avalia todos os mercados elegíveis, filtra EV > 0,
     ordena por EV% decrescente, e retorna os top-N sinais.
-
-    max_signals: se None, retorna todos com EV > 0.
-                 Se set, retorna no máximo esse número (os melhores).
     """
     signals: list[TradeSignal] = []
 

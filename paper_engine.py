@@ -50,11 +50,6 @@ class PaperEngine:
     """
     Gerencia execução de ordens. Modo paper salva no SQLite.
     Modo live (futuro) usaria py-clob-client.
-
-    Uso:
-        engine = PaperEngine(state)
-        result = engine.execute_entry(signal)
-        result = engine.execute_exit(position_id, exit_price, reason)
     """
 
     def __init__(self, state: StateManager, mode: str = MODE):
@@ -91,14 +86,20 @@ class PaperEngine:
                 side=signal.side,
                 entry_price=signal.entry_price,
                 shares=signal.shares,
+                token_id=signal.token_id,
+                target_exit=signal.target_exit,
+                stop_price=signal.stop_price,
+                bounce_exit_pct=signal.bounce_exit_pct,
                 category=signal.category,
                 market_question=signal.question,
             )
 
             logger.info(
-                "PAPER ENTRY: %s %s @ $%.4f × %d = $%.2f | %s",
+                "PAPER ENTRY: %s %s @ $%.4f × %d = $%.2f | TP=$%.4f SL=$%.4f | %s",
                 signal.side, signal.market_id, signal.entry_price,
-                signal.shares, signal.cost, signal.question[:60],
+                signal.shares, signal.cost,
+                signal.target_exit, signal.stop_price,
+                signal.question[:60],
             )
 
             return ExecutionResult(
@@ -125,12 +126,7 @@ class PaperEngine:
     def _execute_entry_live(self, signal: TradeSignal) -> ExecutionResult:
         """
         Live: colocaria ordem limit na CLOB API via py-clob-client.
-
-        Não implementado — retorna erro claro. Quando for implementar:
-          1. Adicionar py-clob-client ao requirements.txt
-          2. Instanciar ClobClient no __init__ com creds do env
-          3. Chamar client.create_and_post_order()
-          4. Aguardar fill e registrar no state
+        Não implementado ainda.
         """
         return ExecutionResult(
             success=False,
@@ -157,7 +153,7 @@ class PaperEngine:
         Live: colocaria ordem de venda na CLOB API.
 
         Reasons válidos: "take_profit", "stop_loss", "resolved_win",
-                         "resolved_loss", "manual", "expired"
+                         "resolved_loss", "bounce_exit", "manual", "expired"
         """
         if self.mode == ExecutionMode.LIVE:
             return self._execute_exit_live(position_id, exit_price, reason)
@@ -224,20 +220,14 @@ class PaperEngine:
         """
         Verifica se uma posição deve ser fechada com base no preço atual.
 
-        Retorna o motivo ("take_profit", "stop_loss", "resolved_win",
-        "resolved_loss") ou None se deve manter aberta.
-
-        O monitor chama isto para cada posição aberta no polling.
+        Retorna o motivo ou None se deve manter aberta.
         """
-        # Resolução do mercado tem prioridade
         if resolved and resolution is not None:
             return "resolved_win" if resolution == "1" else "resolved_loss"
 
-        # Take profit
         if current_price >= target_exit:
             return "take_profit"
 
-        # Stop loss
         if current_price <= stop_price:
             return "stop_loss"
 
@@ -259,10 +249,7 @@ class PaperEngine:
     # ─── Info ────────────────────────────────────────────────────────────
 
     def get_portfolio_summary(self) -> dict:
-        """
-        Resumo do portfolio para o Telegram daily digest.
-        Combina stats do state com modo de operação.
-        """
+        """Resumo do portfolio combinado com modo de operação."""
         stats = self.state.get_stats_summary()
         stats["mode"] = self.mode.value
         return stats
