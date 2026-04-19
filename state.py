@@ -219,6 +219,78 @@ class StateManager:
                 (price, position_id),
             )
 
+    def adjust_position_shares(
+        self,
+        position_id: int,
+        delta_shares: float,
+        adjustment_price: float,
+    ) -> dict[str, any]:
+        """
+        Ajusta shares de uma posição aberta (aumento ou redução).
+        Usado para copytrading quando wallet ajusta posição.
+
+        delta_shares > 0 → compra mais shares
+        delta_shares < 0 → vende shares (partial exit)
+
+        Retorna dados do ajuste para auditoria.
+        """
+        now = datetime.now(timezone.utc).isoformat()
+
+        with self._connect() as conn:
+            row = conn.execute(
+                "SELECT * FROM positions WHERE id = ? AND status = 'open'",
+                (position_id,),
+            ).fetchone()
+
+            if row is None:
+                raise ValueError(f"Posição {position_id} não encontrada ou já fechada")
+
+            new_shares = row["shares"] + delta_shares
+            if new_shares <= 0:
+                raise ValueError("Ajuste resultaria em shares ≤ 0 — use close_position ao invés")
+
+            # Calcular novo preço médio (se compra) ou PnL realizado (se venda)
+            if delta_shares > 0:
+                # Compra: novo preço médio = (custo_atual + custo_adicional) / novas_shares
+                additional_cost = adjustment_price * delta_shares
+                new_entry_price = (row["cost"] + additional_cost) / new_shares
+                new_cost = row["cost"] + additional_cost
+                pnl_realized = 0.0
+            else:
+                # Venda parcial: realiza PnL proporcional
+                sold_pct = abs(delta_shares) / row["shares"]
+                pnl_realized = row["pnl"] * sold_pct if row.get("pnl") else 0.0
+                new_entry_price = row["entry_price"]  # mantém preço médio original
+                new_cost = row["cost"] * (1 - sold_pct)
+
+            # Atualizar posição
+            conn.execute(
+                """UPDATE positions
+                   SET shares = ?, entry_price = ?, cost = ?,
+                       current_price = ?, pnl = pnl - ?
+                   WHERE id = ?""",
+                (new_shares, new_entry_price, new_cost, adjustment_price, pnl_realized, position_id),
+            )
+
+            # Registrar no trades_history
+            action = "adjust_up" if delta_shares > 0 else "adjust_down"
+            conn.execute(
+                """INSERT INTO trades_history
+                   (position_id, action, price, shares, timestamp, reason)
+                   VALUES (?, ?, ?, ?, ?, ?)""",
+                (position_id, action, adjustment_price, abs(delta_shares), now, "mirror_adjust"),
+            )
+
+        return {
+            "position_id": position_id,
+            "delta_shares": delta_shares,
+            "new_shares": new_shares,
+            "adjustment_price": adjustment_price,
+            "pnl_realized": pnl_realized,
+            "new_entry_price": new_entry_price,
+            "new_cost": new_cost,
+        }
+
     def get_open_positions(self, strategy: str | None = None) -> list[dict]:
         query = "SELECT * FROM positions WHERE status = 'open'"
         params: list = []
@@ -364,23 +436,18 @@ class StateManager:
                 "SELECT COUNT(*) as c FROM positions WHERE status = 'open'"
             ).fetchone()["c"]
 
-            open_invested = conn.execute(
-                "SELECT SUM(cost) as c FROM positions WHERE status = 'open'"
-            ).fetchone()["c"] or 0.0
-
             closed = conn.execute(
                 """SELECT COUNT(*) as total,
                           SUM(CASE WHEN pnl > 0 THEN 1 ELSE 0 END) as wins,
                           SUM(pnl) as total_pnl,
-                          SUM(cost) as total_invested_closed
+                          SUM(cost) as total_invested
                    FROM positions WHERE status IN ('closed', 'resolved')"""
             ).fetchone()
 
         total_closed = closed["total"] or 0
         wins = closed["wins"] or 0
         total_pnl = closed["total_pnl"] or 0.0
-        total_invested_closed = closed["total_invested_closed"] or 0.0
-        total_invested = open_invested + total_invested_closed
+        total_invested = closed["total_invested"] or 0.0
 
         return {
             "open_positions": open_count,

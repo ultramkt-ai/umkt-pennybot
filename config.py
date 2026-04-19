@@ -57,7 +57,6 @@ class StrategyParams:
     # Exemplo penny: bounce_exit=None → nunca fecha no bounce (deixa correr
     #   até TP ou resolução, porque o payoff assimétrico é o que gera EV).
     bounce_exit_threshold: float | None = None
-    max_cost_per_position: float | None = None  # Teto de USD por posição
 
     # Override de categorias. None = usa ALLOWED_CATEGORIES global.
     # Lista vazia [] = estratégia desabilitada (não opera em nada).
@@ -101,21 +100,16 @@ def resolve_allowed_categories(strategy: "StrategyParams") -> frozenset[str]:
 
 # ─── Estratégias pré-configuradas ────────────────────────────────────────────
 
-# Bankroll total: $800 ($400 por estratégia)
-# Penny: max 50 posições → max $8/posição ($400 total)
-# NO Sist: max 50 posições → max $8/posição ($400 total)
-
 PENNY_STRATEGY = StrategyParams(
     name="penny",
     side="YES",
     max_price=0.04,
     min_liquidity=1_000.0,
-    min_days_to_expiry=0,       # Permitir mercados de curto prazo
+    min_days_to_expiry=14,
     max_days_to_expiry=200,
-    max_positions=50,           # 50 posições máximas
+    max_positions=100,
     max_per_event=3,
-    kelly_fraction=0.10,        # Kelly conservador
-    max_cost_per_position=8.0,  # TETO: máx $8 por posição → $400 total
+    kelly_fraction=0.25,
     base_win_rate=0.05,
     take_profit=3.0,
     stop_loss=0.5,
@@ -127,12 +121,11 @@ NO_SYSTEMATIC_STRATEGY = StrategyParams(
     side="NO",
     max_price=0.50,
     min_liquidity=1_000.0,
-    min_days_to_expiry=0,       # Permitir mercados de curto prazo
+    min_days_to_expiry=14,
     max_days_to_expiry=200,
-    max_positions=50,           # 50 posições máximas
+    max_positions=100,
     max_per_event=3,
-    kelly_fraction=0.10,        # Kelly conservador
-    max_cost_per_position=8.0,  # TETO: máx $8 por posição → $400 total
+    kelly_fraction=0.25,
     base_win_rate=0.70,
     take_profit=1.5,
     stop_loss=0.5,
@@ -153,6 +146,24 @@ MARKETS_PER_PAGE = 100             # Paginação da Gamma API
 
 MONITOR_INTERVAL_SECONDS = 300     # 5 minutos entre checks de preço
 BOUNCE_THRESHOLD = 0.10            # Variação de 10% para alertar bounce
+
+# ─── Wallet Monitor (Copytrading Reconciliation) ───────────────────────────
+
+WALLET_MONITOR_INTERVAL_SECONDS = 60   # 60 segundos entre reconciliações
+WALLET_ADDRESS = os.environ.get(
+    "PENNY_BOT_WALLET_ADDRESS",
+    "0xa445c59c0531d28a13550f29d734b33520530286"  # Penny strategy wallet
+)
+
+# Copytrading Espelho (Mirror Trading)
+MIRROR_STRICT = os.environ.get("MIRROR_STRICT", "true").lower() == "true"
+# True = replica automaticamente (produção)
+# False = só alerta, não executa (review mode / teste)
+
+MAX_POSITIONS_PER_WALLET = int(os.environ.get("MAX_POSITIONS_PER_WALLET", "200"))
+# Teto de posições copiadas para evitar exposição excessiva
+
+AUTO_COPY_NEW_POSITIONS = MIRROR_STRICT  # legado: agora controlado por MIRROR_STRICT
 
 # ─── Analytics ────────────────────────────────────────────────────────────────
 

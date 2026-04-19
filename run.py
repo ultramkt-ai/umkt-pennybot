@@ -120,7 +120,6 @@ def cmd_scan(
         signals = generate_signals(
             eligible, strategy,
             bankroll=bankroll,
-            max_cost_per_position=strategy.max_cost_per_position,
             max_signals=slots,
         )
         logger.info("  Sinais com EV > 0: %d (slots=%d)", len(signals), slots)

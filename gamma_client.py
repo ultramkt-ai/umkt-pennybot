@@ -233,3 +233,89 @@ def normalize_market(raw_market: dict, parent_event: dict | None = None) -> dict
         "accepting_orders": bool(raw_market.get("acceptingOrders", False)),
         "tags": event_tags,
     }
+
+
+# ─── Wallet Positions API ────────────────────────────────────────────────────
+
+from dataclasses import dataclass
+
+
+@dataclass
+class WalletPosition:
+    """Posição aberta em uma wallet Polymarket."""
+    market_id: str
+    condition_id: str
+    event_id: str
+    question: str
+    side: str  # "YES" ou "NO"
+    shares: float
+    avg_price: float
+    total_cost: float
+    current_value: float
+    realized_pnl: float
+    unrealized_pnl: float
+    token_id: str
+
+
+def get_wallet_positions(wallet_address: str) -> list[WalletPosition]:
+    """
+    Busca todas as posições abertas de uma wallet na Polymarket API.
+
+    Endpoint: GET /positions?user={wallet_address}&market_status=active
+    Retorna lista de WalletPosition com dados normalizados.
+
+    A API retorna posições com:
+      - market, outcome (YES/NO), quantity (shares), averagePrice
+      - realizedPnl, totalCost, position (current value)
+    """
+    params = {
+        "user": wallet_address,
+        "market_status": "active",
+    }
+
+    data = _get_json("positions", params=params)
+
+    if not isinstance(data, list):
+        return []
+
+    positions: list[WalletPosition] = []
+
+    for item in data:
+        market = item.get("market", {})
+        outcome = item.get("outcome", "")
+        side = "YES" if outcome == "YES" else "NO"
+
+        # Token ID vem do market outcomes
+        outcomes = _parse_json_string_list(market.get("outcomes"))
+        token_ids = _parse_json_string_list(market.get("clobTokenIds"))
+
+        # Mapear outcome → token_id
+        token_id = ""
+        if outcome == "YES" and len(token_ids) > 0:
+            token_id = str(token_ids[0])
+        elif outcome == "NO" and len(token_ids) > 1:
+            token_id = str(token_ids[1])
+
+        shares = _safe_float(item.get("quantity"), 0.0)
+        avg_price = _safe_float(item.get("averagePrice"), 0.0)
+        total_cost = _safe_float(item.get("totalCost"), 0.0)
+        current_value = _safe_float(item.get("position"), 0.0)
+        realized_pnl = _safe_float(item.get("realizedPnl"), 0.0)
+        unrealized_pnl = current_value - total_cost
+
+        positions.append(WalletPosition(
+            market_id=str(market.get("id", "")),
+            condition_id=str(market.get("conditionId", "")),
+            event_id=str(market.get("event", {}).get("id", "")),
+            question=market.get("question", ""),
+            side=side,
+            shares=shares,
+            avg_price=avg_price,
+            total_cost=total_cost,
+            current_value=current_value,
+            realized_pnl=realized_pnl,
+            unrealized_pnl=unrealized_pnl,
+            token_id=token_id,
+        ))
+
+    return positions
