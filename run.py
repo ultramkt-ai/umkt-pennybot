@@ -18,9 +18,11 @@ from __future__ import annotations
 
 import argparse
 import logging
+from dataclasses import asdict
 import signal
 import sys
 import time
+from collections import defaultdict
 from datetime import datetime, timezone
 
 from config import (
@@ -32,8 +34,9 @@ from config import (
 )
 from state import StateManager
 from scanner import scan_allowed_categories
+from gamma_client import fetch_event_by_id, normalize_market, GammaAPIError
 from filters import filter_markets
-from strategy import generate_signals
+from strategy import generate_signals, calculate_targets
 from paper_engine import PaperEngine
 from monitor import Monitor
 from analytics import Analytics
@@ -93,6 +96,22 @@ def cmd_scan(
     # 2. Buscar mercados do cache (inclui os recém-escaneados)
     cached_markets = state.get_active_markets()
     logger.info("Mercados no cache: %d", len(cached_markets))
+    market_map = {m.get("market_id"): m for m in cached_markets}
+
+    state.record_ledger_event(
+        event_type="scan_cycle",
+        reason="scan_start",
+        source="run.cmd_scan",
+        payload={
+            "mode": MODE,
+            "bankroll": bankroll,
+            "categories": list(ALLOWED_CATEGORIES),
+            "markets_in_cache": len(cached_markets),
+            "scan_summary": scan_result.summary(),
+            "scan_errors": scan_result.errors,
+            "scan_by_category": scan_result.by_category,
+        },
+    )
 
     total_entries = 0
 
@@ -100,37 +119,199 @@ def cmd_scan(
     for strategy_name, strategy in STRATEGIES.items():
         logger.info("--- Estratégia: %s ---", strategy_name)
 
+        open_positions_before = state.count_open_positions(strategy_name)
+        open_invested_before = state.get_open_invested(strategy_name)
+        available_capital = max(0.0, bankroll - open_invested_before)
+        state.set_strategy_runtime(
+            strategy_name,
+            bankroll,
+            payload={
+                "open_positions_before": open_positions_before,
+                "open_invested_before": round(open_invested_before, 4),
+                "available_capital_before": round(available_capital, 4),
+            },
+        )
+
         # Filtrar elegíveis
         eligible, summaries = filter_markets(cached_markets, strategy, state)
         rejected = [s for s in summaries if not s.passed]
+        passed = [s for s in summaries if s.passed]
         logger.info(
             "  Filtro: %d elegíveis, %d rejeitados (de %d mercados)",
             len(eligible), len(rejected), len(cached_markets),
         )
 
+        state.record_ledger_event(
+            event_type="strategy_scan_summary",
+            strategy=strategy_name,
+            reason="filter_complete",
+            source="run.cmd_scan",
+            payload={
+                "bankroll": bankroll,
+                "eligible_count": len(eligible),
+                "rejected_count": len(rejected),
+                "cached_markets": len(cached_markets),
+                "max_positions": strategy.max_positions,
+                "open_positions_before": open_positions_before,
+                "open_invested_before": round(open_invested_before, 4),
+                "available_capital_before": round(available_capital, 4),
+                "scan_interval_seconds": SCAN_INTERVAL_SECONDS,
+            },
+        )
+
+        rejection_counts: dict[str, int] = {}
+        rejection_examples: dict[str, dict] = {}
+        for summary in rejected:
+            key = summary.failed_at or "unknown_filter"
+            rejection_counts[key] = rejection_counts.get(key, 0) + 1
+            rejection_examples.setdefault(
+                key,
+                {
+                    "market_id": summary.market_id,
+                    "question": summary.question,
+                    "reason": summary.reason,
+                },
+            )
+
+        if rejected:
+            state.record_ledger_event(
+                event_type="market_rejections_aggregate",
+                strategy=strategy_name,
+                reason="filter_rejections_aggregated",
+                source="run.cmd_scan",
+                payload={
+                    "total_rejected": len(rejected),
+                    "rejection_counts": rejection_counts,
+                    "examples": rejection_examples,
+                },
+            )
+
         if not eligible:
             continue
 
         # Gerar sinais (EV > 0, ordenados por EV%)
-        slots = strategy.max_positions - state.count_open_positions(strategy_name)
-        if slots <= 0:
-            logger.info("  Sem slots disponíveis (max=%d)", strategy.max_positions)
+        slots = strategy.max_positions - open_positions_before
+        if slots <= 0 or available_capital <= 0:
+            reason = "no_slots_available" if slots <= 0 else "no_capital_available"
+            logger.info(
+                "  Sem capacidade disponível (slots=%d, capital_disponivel=$%.2f)",
+                slots,
+                available_capital,
+            )
+            state.record_ledger_event(
+                event_type="market_skipped_capacity_aggregate",
+                strategy=strategy_name,
+                reason=reason,
+                source="run.cmd_scan",
+                payload={
+                    "total_skipped": len(passed),
+                    "max_positions": strategy.max_positions,
+                    "available_capital": round(available_capital, 4),
+                    "open_invested_before": round(open_invested_before, 4),
+                    "example_market_ids": [summary.market_id for summary in passed[:20]],
+                },
+            )
             continue
 
-        signals = generate_signals(
+        ranked_signals = generate_signals(
             eligible, strategy,
             bankroll=bankroll,
-            max_signals=slots,
+            max_signals=None,
         )
-        logger.info("  Sinais com EV > 0: %d (slots=%d)", len(signals), slots)
+        capital_limited_selection = []
+        overflow_signals = []
+        running_cost = 0.0
+        for signal in ranked_signals:
+            if len(capital_limited_selection) >= slots:
+                overflow_signals.append(signal)
+                continue
+            next_cost = running_cost + signal.cost
+            if next_cost <= available_capital + 1e-9:
+                capital_limited_selection.append(signal)
+                running_cost = next_cost
+            else:
+                overflow_signals.append(signal)
 
-        if not signals:
+        selected_signals = capital_limited_selection
+        logger.info(
+            "  Sinais com EV > 0: %d (slots=%d, capital_disponivel=$%.2f, selecionados=%d, custo_selecionado=$%.2f)",
+            len(ranked_signals), slots, available_capital, len(selected_signals), running_cost
+        )
+
+        tokenless_selected = [signal for signal in selected_signals if not signal.token_id]
+        if tokenless_selected:
+            logger.error(
+                "  %d sinais selecionados sem token_id. Entradas serão bloqueadas para evitar posições sem monitoramento.",
+                len(tokenless_selected),
+            )
+            tokenless_events = []
+            for signal in tokenless_selected:
+                tokenless_events.append({
+                    "event_type": "signal_blocked_missing_token",
+                    "strategy": strategy_name,
+                    "market_id": signal.market_id,
+                    "event_id": signal.event_id,
+                    "condition_id": signal.condition_id,
+                    "side": signal.side,
+                    "position_status": "blocked",
+                    "price": signal.entry_price,
+                    "shares": signal.shares,
+                    "notional": signal.cost,
+                    "reason": "missing_token_id",
+                    "source": "run.cmd_scan",
+                    "payload": {"signal": asdict(signal)},
+                })
+            state.record_ledger_events(tokenless_events)
+            selected_signals = [signal for signal in selected_signals if signal.token_id]
+
+        if ranked_signals:
+            state.record_ledger_event(
+                event_type="signal_generation_aggregate",
+                strategy=strategy_name,
+                reason="signals_ranked",
+                source="run.cmd_scan",
+                payload={
+                    "ranked_signals": len(ranked_signals),
+                    "selected_signals": len(selected_signals),
+                    "overflow_signals": len(overflow_signals),
+                    "slots": slots,
+                    "available_capital": round(available_capital, 4),
+                    "selected_examples": [asdict(signal) for signal in selected_signals[:10]],
+                    "overflow_examples": [asdict(signal) for signal in overflow_signals[:10]],
+                },
+            )
+
+        if not selected_signals:
             continue
 
         # Executar entradas
-        results = engine.execute_entries(signals)
+        results = engine.execute_entries(selected_signals)
         entries = [r for r in results if r.success]
         total_entries += len(entries)
+
+        execution_events = []
+        for signal, result in zip(selected_signals, results):
+            execution_events.append({
+                "position_id": result.position_id,
+                "event_type": "entry_execution_result",
+                "strategy": strategy_name,
+                "market_id": signal.market_id,
+                "event_id": signal.event_id,
+                "condition_id": signal.condition_id,
+                "side": signal.side,
+                "position_status": "open" if result.success else "rejected",
+                "price": signal.entry_price,
+                "shares": signal.shares,
+                "notional": signal.cost,
+                "reason": "executed" if result.success else "execution_failed",
+                "source": "run.cmd_scan",
+                "payload": {
+                    "signal": asdict(signal),
+                    "result_message": result.message,
+                    "success": result.success,
+                },
+            })
+        state.record_ledger_events(execution_events)
 
         logger.info("  Entradas executadas: %d", len(entries))
 
@@ -254,6 +435,261 @@ def cmd_status(state: StateManager) -> None:
     print(f"ROI:      {stats['roi']:.1%}")
 
 
+# ─── Repair: restaurar token_ids faltantes ─────────────────────────────────
+
+def cmd_repair_tokens(state: StateManager) -> dict[str, int]:
+    """
+    Reconstroi token_ids faltantes das posições abertas usando a Gamma API.
+
+    Fluxo:
+      1. Carrega posições abertas sem token_id
+      2. Busca os eventos de origem diretamente por event_id
+      3. Normaliza e regrava mercados no cache com yes/no token ids
+      4. Atualiza cada posição com o token correto para seu side
+      5. Registra trilha de auditoria no ledger
+    """
+    logger.info("=== TOKEN REPAIR START ===")
+
+    open_positions = state.get_open_positions()
+    missing_positions = [pos for pos in open_positions if not pos.get("token_id")]
+    summary = {
+        "open_positions": len(open_positions),
+        "missing_positions": len(missing_positions),
+        "events_requested": 0,
+        "markets_refreshed": 0,
+        "positions_backfilled": 0,
+        "positions_failed": 0,
+    }
+
+    state.record_ledger_event(
+        event_type="token_repair_cycle",
+        reason="start",
+        source="run.cmd_repair_tokens",
+        payload=summary,
+    )
+
+    if not missing_positions:
+        logger.info("Nenhuma posição aberta está sem token_id")
+        return summary
+
+    positions_by_event: dict[str, list[dict]] = defaultdict(list)
+    for pos in missing_positions:
+        positions_by_event[pos.get("event_id", "")].append(pos)
+
+    market_map: dict[str, dict] = {}
+    for event_id, positions in positions_by_event.items():
+        if not event_id:
+            logger.error("Evento vazio em %d posições sem token_id", len(positions))
+            for pos in positions:
+                summary["positions_failed"] += 1
+                state.record_ledger_event(
+                    position_id=pos["id"],
+                    event_type="position_token_backfill_failed",
+                    strategy=pos["strategy"],
+                    market_id=pos["market_id"],
+                    event_id=pos.get("event_id"),
+                    condition_id=pos.get("condition_id"),
+                    side=pos["side"],
+                    position_status=pos.get("status"),
+                    reason="missing_event_id",
+                    source="run.cmd_repair_tokens",
+                    payload={"position": pos},
+                )
+            continue
+
+        summary["events_requested"] += 1
+        logger.info(
+            "Recarregando evento %s para %d posições sem token_id",
+            event_id,
+            len(positions),
+        )
+
+        try:
+            event = fetch_event_by_id(event_id)
+        except GammaAPIError as e:
+            logger.error("Falha ao buscar evento %s: %s", event_id, e)
+            for pos in positions:
+                summary["positions_failed"] += 1
+                state.record_ledger_event(
+                    position_id=pos["id"],
+                    event_type="position_token_backfill_failed",
+                    strategy=pos["strategy"],
+                    market_id=pos["market_id"],
+                    event_id=pos.get("event_id"),
+                    condition_id=pos.get("condition_id"),
+                    side=pos["side"],
+                    position_status=pos.get("status"),
+                    reason="event_fetch_failed",
+                    source="run.cmd_repair_tokens",
+                    payload={"error": str(e)},
+                )
+            continue
+
+        raw_markets = event.get("markets") or []
+        for raw_market in raw_markets:
+            market = normalize_market(raw_market, parent_event=event)
+            state.upsert_market(market)
+            market_map[market["market_id"]] = market
+            summary["markets_refreshed"] += 1
+
+    for pos in missing_positions:
+        market = market_map.get(pos["market_id"]) or state.get_cached_market(pos["market_id"])
+        if market is None:
+            summary["positions_failed"] += 1
+            state.record_ledger_event(
+                position_id=pos["id"],
+                event_type="position_token_backfill_failed",
+                strategy=pos["strategy"],
+                market_id=pos["market_id"],
+                event_id=pos.get("event_id"),
+                condition_id=pos.get("condition_id"),
+                side=pos["side"],
+                position_status=pos.get("status"),
+                reason="market_not_found_after_refresh",
+                source="run.cmd_repair_tokens",
+                payload={"position": pos},
+            )
+            continue
+
+        token_id = market.get("yes_token_id") if pos["side"] == "YES" else market.get("no_token_id")
+        if not token_id:
+            summary["positions_failed"] += 1
+            state.record_ledger_event(
+                position_id=pos["id"],
+                event_type="position_token_backfill_failed",
+                strategy=pos["strategy"],
+                market_id=pos["market_id"],
+                event_id=pos.get("event_id"),
+                condition_id=pos.get("condition_id"),
+                side=pos["side"],
+                position_status=pos.get("status"),
+                reason="token_missing_after_refresh",
+                source="run.cmd_repair_tokens",
+                payload={
+                    "position": pos,
+                    "market": market,
+                },
+            )
+            continue
+
+        state.update_position_token_id(
+            pos["id"],
+            token_id,
+            source="run.cmd_repair_tokens",
+            payload={
+                "market_question": pos.get("market_question"),
+                "market_category": market.get("category"),
+                "side": pos["side"],
+                "event_id": pos.get("event_id"),
+            },
+        )
+        summary["positions_backfilled"] += 1
+
+    state.record_ledger_event(
+        event_type="token_repair_cycle",
+        reason="completed",
+        source="run.cmd_repair_tokens",
+        payload=summary,
+    )
+
+    logger.info(
+        "=== TOKEN REPAIR END === open=%d missing=%d refreshed_markets=%d backfilled=%d failed=%d",
+        summary["open_positions"],
+        summary["missing_positions"],
+        summary["markets_refreshed"],
+        summary["positions_backfilled"],
+        summary["positions_failed"],
+    )
+    print(summary)
+    return summary
+
+
+def cmd_repair_open_risk_params(state: StateManager) -> dict[str, int]:
+    """
+    Recalcula target/stop/bounce das posições abertas usando a lógica atual da estratégia.
+
+    Serve para sanar posições legadas abertas com parâmetros incoerentes no banco,
+    preservando trilha de auditoria por posição.
+    """
+    logger.info("=== RISK PARAM REPAIR START ===")
+    open_positions = state.get_open_positions()
+    summary = {
+        "open_positions": len(open_positions),
+        "positions_repaired": 0,
+        "positions_skipped": 0,
+        "positions_failed": 0,
+    }
+
+    state.record_ledger_event(
+        event_type="risk_param_repair_cycle",
+        reason="start",
+        source="run.cmd_repair_open_risk_params",
+        payload=summary,
+    )
+
+    for pos in open_positions:
+        strategy = STRATEGIES.get(pos["strategy"])
+        if strategy is None:
+            summary["positions_failed"] += 1
+            state.record_ledger_event(
+                position_id=pos["id"],
+                event_type="position_risk_param_repair_failed",
+                strategy=pos["strategy"],
+                market_id=pos["market_id"],
+                event_id=pos.get("event_id"),
+                condition_id=pos.get("condition_id"),
+                side=pos["side"],
+                position_status=pos.get("status"),
+                reason="strategy_not_found",
+                source="run.cmd_repair_open_risk_params",
+                payload={"position": pos},
+            )
+            continue
+
+        target_exit, stop_price = calculate_targets(pos["entry_price"], strategy)
+        current_target = pos.get("target_exit")
+        current_stop = pos.get("stop_price")
+        current_bounce = pos.get("bounce_exit_pct")
+
+        if (
+            current_target == target_exit
+            and current_stop == stop_price
+            and current_bounce == strategy.bounce_exit_threshold
+        ):
+            summary["positions_skipped"] += 1
+            continue
+
+        state.update_position_risk_params(
+            pos["id"],
+            target_exit=target_exit,
+            stop_price=stop_price,
+            bounce_exit_pct=strategy.bounce_exit_threshold,
+            source="run.cmd_repair_open_risk_params",
+            payload={
+                "entry_price": pos["entry_price"],
+                "market_question": pos.get("market_question"),
+                "strategy_name": strategy.name,
+            },
+        )
+        summary["positions_repaired"] += 1
+
+    state.record_ledger_event(
+        event_type="risk_param_repair_cycle",
+        reason="completed",
+        source="run.cmd_repair_open_risk_params",
+        payload=summary,
+    )
+    logger.info(
+        "=== RISK PARAM REPAIR END === open=%d repaired=%d skipped=%d failed=%d",
+        summary["open_positions"],
+        summary["positions_repaired"],
+        summary["positions_skipped"],
+        summary["positions_failed"],
+    )
+    print(summary)
+    return summary
+
+
 # ─── Loop: ciclo contínuo ───────────────────────────────────────────────────
 
 def cmd_loop(
@@ -328,6 +764,8 @@ def cmd_loop(
         if today != last_digest_day:
             try:
                 cmd_digest(analytics, notifier)
+                cleanup_summary = state.cleanup_ledger_events()
+                logger.info("Ledger cleanup: %s", cleanup_summary)
                 # Snapshot diário
                 snap_path = state.save_snapshot()
                 logger.info("Snapshot: %s", snap_path)
@@ -358,13 +796,16 @@ def main() -> None:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Comandos:
-  scan       Busca mercados, filtra, gera sinais, executa entradas
-  monitor    Um ciclo de monitoramento (preços, TP/SL, resolução)
-  report     Relatório consolidado no terminal
-  digest     Envia daily digest no Telegram
-  export     Exporta trade log (CSV + JSON) e relatório
-  status     Status rápido do portfolio
-  loop       Ciclo contínuo (scan + monitor + digest)
+  scan          Busca mercados, filtra, gera sinais, executa entradas
+  monitor       Um ciclo de monitoramento (preços, TP/SL, resolução)
+  report        Relatório consolidado no terminal
+  digest        Envia daily digest no Telegram
+  export        Exporta trade log (CSV + JSON) e relatório
+  status        Status rápido do portfolio
+  repair-tokens Reconstroi token_ids faltantes das posições abertas
+  repair-risk   Recalcula target/stop/bounce das posições abertas
+  cleanup       Remove eventos volumosos do ledger; opcionalmente faz VACUUM
+  loop          Ciclo contínuo (scan + monitor + digest)
 
 Exemplos:
   python run.py scan                    # Scan único
@@ -376,7 +817,7 @@ Exemplos:
     )
     parser.add_argument(
         "command",
-        choices=["scan", "monitor", "report", "digest", "export", "status", "loop"],
+        choices=["scan", "monitor", "report", "digest", "export", "status", "repair-tokens", "repair-risk", "cleanup", "loop"],
         help="Comando a executar",
     )
     parser.add_argument(
@@ -390,11 +831,24 @@ Exemplos:
         default=1000.0,
         help="Bankroll para sizing (default: $1000)",
     )
+    parser.add_argument(
+        "--vacuum",
+        action="store_true",
+        help="Após cleanup do ledger, roda VACUUM para devolver espaço ao disco",
+    )
 
     args = parser.parse_args()
     setup_logging(args.verbose)
 
     state, engine, monitor, analytics, notifier = create_components()
+
+    def cmd_cleanup() -> None:
+        summary = state.cleanup_ledger_events()
+        print(summary)
+        if args.vacuum:
+            with state._connect() as conn:
+                conn.execute("VACUUM")
+            print({"vacuum": "completed"})
 
     commands = {
         "scan": lambda: cmd_scan(state, engine, notifier, args.bankroll),
@@ -403,6 +857,9 @@ Exemplos:
         "digest": lambda: cmd_digest(analytics, notifier),
         "export": lambda: cmd_export(analytics),
         "status": lambda: cmd_status(state),
+        "repair-tokens": lambda: cmd_repair_tokens(state),
+        "repair-risk": lambda: cmd_repair_open_risk_params(state),
+        "cleanup": cmd_cleanup,
         "loop": lambda: cmd_loop(
             state, engine, monitor, analytics, notifier, args.bankroll
         ),

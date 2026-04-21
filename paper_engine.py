@@ -14,7 +14,7 @@ A interface execute_order() é a mesma — só muda o backend.
 from __future__ import annotations
 
 import logging
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 from enum import Enum
 
 from config import MODE
@@ -77,6 +77,21 @@ class PaperEngine:
 
     def _execute_entry_paper(self, signal: TradeSignal) -> ExecutionResult:
         """Paper: registra posição no SQLite como se a ordem tivesse sido preenchida."""
+        if not signal.token_id:
+            logger.error(
+                "ENTRY BLOCKED: signal sem token_id | strategy=%s market=%s side=%s question=%s",
+                signal.strategy_name,
+                signal.market_id,
+                signal.side,
+                signal.question[:80],
+            )
+            return ExecutionResult(
+                success=False,
+                position_id=None,
+                message="Entrada bloqueada: signal sem token_id monitorável.",
+                signal=signal,
+            )
+
         try:
             position_id = self.state.open_position(
                 market_id=signal.market_id,
@@ -92,6 +107,11 @@ class PaperEngine:
                 bounce_exit_pct=signal.bounce_exit_pct,
                 category=signal.category,
                 market_question=signal.question,
+                audit_payload={
+                    "signal": asdict(signal),
+                    "execution_mode": self.mode.value,
+                },
+                source="paper_engine.entry",
             )
 
             logger.info(
@@ -145,6 +165,9 @@ class PaperEngine:
         position_id: int,
         exit_price: float,
         reason: str,
+        *,
+        source: str = "paper_engine.exit",
+        audit_payload: dict | None = None,
     ) -> ExecutionResult:
         """
         Fecha uma posição aberta.
@@ -157,16 +180,34 @@ class PaperEngine:
         """
         if self.mode == ExecutionMode.LIVE:
             return self._execute_exit_live(position_id, exit_price, reason)
-        return self._execute_exit_paper(position_id, exit_price, reason)
+        return self._execute_exit_paper(
+            position_id,
+            exit_price,
+            reason,
+            source=source,
+            audit_payload=audit_payload,
+        )
 
     def _execute_exit_paper(
         self,
         position_id: int,
         exit_price: float,
         reason: str,
+        *,
+        source: str = "paper_engine.exit",
+        audit_payload: dict | None = None,
     ) -> ExecutionResult:
         try:
-            result = self.state.close_position(position_id, exit_price, reason)
+            result = self.state.close_position(
+                position_id,
+                exit_price,
+                reason,
+                audit_payload={
+                    "execution_mode": self.mode.value,
+                    **(audit_payload or {}),
+                },
+                source=source,
+            )
 
             logger.info(
                 "PAPER EXIT: pos=%d %s @ $%.4f → $%.4f | PnL=$%.4f (%s) | %s",

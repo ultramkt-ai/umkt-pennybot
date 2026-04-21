@@ -164,7 +164,17 @@ class Monitor:
                 result.prices_failed += 1
             return
 
-        self.state.update_current_price(position_id, new_price)
+        self.state.update_current_price(
+            position_id,
+            new_price,
+            source="monitor.price_update",
+            payload={
+                "market_id": pos["market_id"],
+                "strategy": pos["strategy"],
+                "side": pos["side"],
+            },
+            record_ledger=True,
+        )
 
         # 2. Detectar bounce significativo (pode fechar posição se bounce_profit)
         exited_by_bounce = self._check_bounce(pos, old_price, new_price, result)
@@ -229,6 +239,22 @@ class Monitor:
             },
         )
         result.events.append(event)
+        self.state.record_ledger_event(
+            position_id=pos["id"],
+            event_type="bounce_alert",
+            strategy=pos["strategy"],
+            market_id=pos["market_id"],
+            event_id=pos.get("event_id"),
+            condition_id=pos.get("condition_id"),
+            side=pos["side"],
+            position_status=pos.get("status"),
+            price=new_price,
+            shares=pos.get("shares"),
+            notional=(new_price * pos.get("shares", 0)) if pos.get("shares") else None,
+            reason=direction.lower(),
+            source="monitor.bounce",
+            payload=event.details,
+        )
         logger.info(
             "BOUNCE %s: %s %s %.4f → %.4f (%.1f%%)",
             direction, pos["side"], pos["market_id"],
@@ -254,7 +280,19 @@ class Monitor:
                 "BOUNCE EXIT: preço $%.4f ≥ bounce_exit $%.4f (%.0f%% do TP)",
                 new_price, bounce_exit_price, bounce_exit_pct * 100,
             )
-            self._execute_exit(pos, new_price, "bounce_exit", result)
+            self._execute_exit(
+                pos,
+                new_price,
+                "bounce_exit",
+                result,
+                audit_payload={
+                    "bounce_exit_price": bounce_exit_price,
+                    "old_price": old_price,
+                    "new_price": new_price,
+                    "change_pct": change_pct,
+                },
+                source="monitor.bounce_exit",
+            )
             return True  # posição fechada
 
         return False
@@ -305,7 +343,19 @@ class Monitor:
             exit_price = current_price
             reason = "resolved_loss"
 
-        exec_result = self.engine.execute_exit(pos["id"], exit_price, reason)
+        exec_result = self.engine.execute_exit(
+            pos["id"],
+            exit_price,
+            reason,
+            source="monitor.resolution",
+            audit_payload={
+                "resolution": resolution,
+                "current_price": current_price,
+                "side": side,
+                "market_id": pos["market_id"],
+                "strategy": pos["strategy"],
+            },
+        )
         if exec_result.success:
             result.resolutions_detected += 1
             result.exits_executed += 1
@@ -331,9 +381,23 @@ class Monitor:
         exit_price: float,
         reason: str,
         result: MonitorResult,
+        audit_payload: dict | None = None,
+        source: str = "monitor.exit",
     ) -> None:
         """Executa saída por TP ou SL."""
-        exec_result = self.engine.execute_exit(pos["id"], exit_price, reason)
+        exec_result = self.engine.execute_exit(
+            pos["id"],
+            exit_price,
+            reason,
+            source=source,
+            audit_payload={
+                "current_price": exit_price,
+                "side": pos["side"],
+                "market_id": pos["market_id"],
+                "strategy": pos["strategy"],
+                **(audit_payload or {}),
+            },
+        )
         if exec_result.success:
             result.exits_executed += 1
             result.events.append(MonitorEvent(

@@ -38,6 +38,10 @@ class TradeSignal:
     bounce_exit_pct: float | None  # Fração do TP para bounce exit (None = penny)
     category: str
     strategy_name: str
+    bankroll: float
+    base_win_rate: float
+    kelly_fraction_used: float
+    max_cost_per_position: float | None = None
 
 
 # ─── Cálculos ────────────────────────────────────────────────────────────────
@@ -136,7 +140,7 @@ def calculate_targets(
     Retorna (target_exit, stop_price).
     """
     target_exit = min(entry_price * strategy.take_profit, 0.99)
-    stop_price = max(entry_price * (1 - strategy.stop_loss), 0.01)
+    stop_price = max(entry_price * (1 - strategy.stop_loss), 0.0)
     return target_exit, stop_price
 
 
@@ -200,6 +204,10 @@ def evaluate_market(
         bounce_exit_pct=strategy.bounce_exit_threshold,
         category=market.get("category", "other"),
         strategy_name=strategy.name,
+        bankroll=round(bankroll, 4),
+        base_win_rate=round(strategy.base_win_rate, 6),
+        kelly_fraction_used=round(kelly_frac, 6),
+        max_cost_per_position=max_cost_per_position,
     )
 
 

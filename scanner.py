@@ -78,10 +78,16 @@ def scan_allowed_categories(
 
         try:
             count_before = result.total_markets
+            buffered_markets: list[dict] = []
             for event in fetch_events_by_tag(tag_id, closed=False, active=True):
-                result.total_markets += _process_event(
-                    event, state, seen_market_ids, result
+                added, normalized_markets = _process_event(
+                    event, seen_market_ids, result
                 )
+                result.total_markets += added
+                if normalized_markets:
+                    buffered_markets.extend(normalized_markets)
+
+            state.upsert_markets(buffered_markets)
             count_added = result.total_markets - count_before
             result.by_category[category] = count_added
             logger.info("  → %d mercados de %s", count_added, category)
@@ -97,10 +103,9 @@ def scan_allowed_categories(
 
 def _process_event(
     event: dict,
-    state: StateManager,
     seen: set[str],
     result: ScanResult,
-) -> int:
+) -> tuple[int, list[dict]]:
     """
     Extrai mercados de um evento, normaliza, classifica, salva no cache.
     Retorna quantos mercados novos foram processados.
@@ -110,6 +115,7 @@ def _process_event(
     """
     markets = event.get("markets") or []
     added = 0
+    normalized_markets: list[dict] = []
 
     for raw_market in markets:
         market = normalize_market(raw_market, parent_event=event)
@@ -121,10 +127,10 @@ def _process_event(
         category = classify_market_by_tags(market["tags"])
         market["category"] = category
 
-        state.upsert_market(market)
+        normalized_markets.append(market)
         added += 1
 
-    return added
+    return added, normalized_markets
 
 
 # ─── CLI de debug ────────────────────────────────────────────────────────────

@@ -13,12 +13,16 @@ Não classifica, não filtra, não decide — só busca e normaliza.
 from __future__ import annotations
 
 import json
+import logging
 import time
 from typing import Any, Iterator
 
 import requests
 
 from config import GAMMA_API_BASE
+
+
+logger = logging.getLogger(__name__)
 
 
 _MIN_INTERVAL_SECONDS = 0.1
@@ -51,19 +55,81 @@ def _get_json(
 
     for attempt in range(max_retries):
         _throttle(endpoint)
+        started_at = time.monotonic()
         try:
             resp = requests.get(url, params=params, timeout=timeout)
+            elapsed = time.monotonic() - started_at
         except requests.RequestException as e:
+            elapsed = time.monotonic() - started_at
+            logger.warning(
+                "Gamma request exception: endpoint=%s time=%.3fs attempt=%d/%d error=%s params=%s",
+                endpoint,
+                elapsed,
+                attempt + 1,
+                max_retries,
+                e,
+                params,
+            )
             if attempt == max_retries - 1:
                 raise GammaAPIError(f"Falha de rede em {url}: {e}") from e
             time.sleep(2 ** attempt)
             continue
 
+        if elapsed > 2.0:
+            logger.warning(
+                "Gamma slow response: endpoint=%s status=%s time=%.3fs attempt=%d/%d params=%s",
+                endpoint,
+                resp.status_code,
+                elapsed,
+                attempt + 1,
+                max_retries,
+                params,
+            )
+
         if resp.status_code == 200:
             try:
                 return resp.json()
             except ValueError as e:
+                logger.warning(
+                    "Gamma invalid JSON: endpoint=%s status=%s time=%.3fs params=%s error=%s",
+                    endpoint,
+                    resp.status_code,
+                    elapsed,
+                    params,
+                    e,
+                )
                 raise GammaAPIError(f"Resposta inválida de {url}: {e}") from e
+
+        if resp.status_code == 403:
+            logger.warning(
+                "Gamma access denied: endpoint=%s status=403 time=%.3fs attempt=%d/%d params=%s",
+                endpoint,
+                elapsed,
+                attempt + 1,
+                max_retries,
+                params,
+            )
+
+        if resp.status_code == 429:
+            logger.warning(
+                "Gamma rate limit: endpoint=%s status=429 time=%.3fs attempt=%d/%d params=%s",
+                endpoint,
+                elapsed,
+                attempt + 1,
+                max_retries,
+                params,
+            )
+
+        if resp.status_code in (500, 502, 503, 504):
+            logger.warning(
+                "Gamma server error: endpoint=%s status=%s time=%.3fs attempt=%d/%d params=%s",
+                endpoint,
+                resp.status_code,
+                elapsed,
+                attempt + 1,
+                max_retries,
+                params,
+            )
 
         if resp.status_code in (429, 500, 502, 503, 504):
             if attempt == max_retries - 1:
@@ -104,6 +170,16 @@ def _safe_float(value: Any, default: float = 0.0) -> float:
 
 
 # ─── API pública: buscar eventos e mercados ──────────────────────────────────
+
+def fetch_event_by_id(event_id: str | int) -> dict:
+    """
+    Busca um evento único pelo ID na Gamma API.
+
+    Usado para auditoria e backfill de token_ids de posições já abertas,
+    inclusive quando a categoria atual não está mais habilitada no scanner.
+    """
+    return _get_json(f"events/{event_id}")
+
 
 def fetch_events_by_tag(
     tag_id: int,

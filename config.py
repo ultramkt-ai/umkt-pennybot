@@ -22,7 +22,7 @@ TELEGRAM_CHAT_ID = os.environ.get("TELEGRAM_CHAT_ID", "YOUR_CHAT_ID_HERE")
 
 # ─── Persistência ────────────────────────────────────────────────────────────
 
-DB_PATH = os.environ.get("BOT_DB_PATH", "data/positions.db")
+DB_PATH = os.environ.get("BOT_DB_PATH", "data/umkt_pennybot.db")
 SNAPSHOTS_DIR = os.environ.get("BOT_SNAPSHOTS_DIR", "data/snapshots")
 
 # ─── Modo de operação ────────────────────────────────────────────────────────
@@ -61,9 +61,8 @@ class StrategyParams:
 
 ALLOWED_CATEGORIES: tuple[str, ...] = (
     "crypto",
-    "sports",
+    "geopolitics",
     "tech",
-    "finance",
 )
 
 
@@ -89,15 +88,31 @@ PENNY_STRATEGY = StrategyParams(
     side="YES",
     max_price=0.04,
     min_liquidity=1_000.0,
-    min_days_to_expiry=14,
-    max_days_to_expiry=200,
+    min_days_to_expiry=3,
+    max_days_to_expiry=60,
     max_positions=100,
-    max_per_event=3,
+    max_per_event=5,
     kelly_fraction=0.25,
     base_win_rate=0.05,
-    take_profit=3.0,
+    take_profit=1.5,
     stop_loss=0.5,
     bounce_exit_threshold=None,   # ← só alerta, preserva payoff assimétrico
+)
+
+PENNY_NO_STRATEGY = StrategyParams(
+    name="penny_no",
+    side="NO",
+    max_price=0.04,
+    min_liquidity=1_000.0,
+    min_days_to_expiry=3,
+    max_days_to_expiry=60,
+    max_positions=100,
+    max_per_event=5,
+    kelly_fraction=0.25,
+    base_win_rate=0.05,
+    take_profit=1.5,
+    stop_loss=0.5,
+    bounce_exit_threshold=None,
 )
 
 NO_SYSTEMATIC_STRATEGY = StrategyParams(
@@ -118,17 +133,18 @@ NO_SYSTEMATIC_STRATEGY = StrategyParams(
 
 STRATEGIES = {
     "penny": PENNY_STRATEGY,
+    "penny_no": PENNY_NO_STRATEGY,
     "no_systematic": NO_SYSTEMATIC_STRATEGY,
 }
 
 # ─── Scanner ─────────────────────────────────────────────────────────────────
 
-SCAN_INTERVAL_SECONDS = 3600       # 1 hora entre scans
+SCAN_INTERVAL_SECONDS = 300       # 5 minutos entre scans
 MARKETS_PER_PAGE = 100             # Paginação da Gamma API
 
 # ─── Monitor ─────────────────────────────────────────────────────────────────
 
-MONITOR_INTERVAL_SECONDS = 300     # 5 minutos entre checks de preço
+MONITOR_INTERVAL_SECONDS = 60     # 1 minuto entre checks de preço
 BOUNCE_THRESHOLD = 0.10            # Variação de 10% para alertar bounce
 
 # ─── Analytics ────────────────────────────────────────────────────────────────
